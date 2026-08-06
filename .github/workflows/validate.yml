@@ -9,15 +9,17 @@ on:
   push:
     branches:
       - main
-      - restart/rebuild-catalog
+      - 'restart/**'
   workflow_dispatch:
 
 jobs:
   validate:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
+      - name: Checkout full history
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -26,6 +28,19 @@ jobs:
 
       - name: Validate catalog and draft inventory
         run: node scripts/validate.js
+
+      - name: Verify source-bearing release assets
+        run: node scripts/verify-release-assets.js
+
+      - name: Reject checked-in release binaries
+        run: |
+          set -euo pipefail
+          tracked=$(git ls-files '*.ko' '*.kpm' '*.zip' '*.sig')
+          if [ -n "$tracked" ]; then
+            printf '%s\n' "$tracked"
+            echo "::error::Release binaries and signatures belong in GitHub Releases, not the source tree"
+            exit 1
+          fi
 
       - name: Reject installable Linux-module sources
         run: |
@@ -37,12 +52,23 @@ jobs:
               echo "::error file=$source::Installable entries must use KernelPatch KPM interfaces, not Linux module_init/module_exit"
               exit 1
             fi
-            grep -q 'KPM_NAME(' "$source" || {
-              echo "::error file=$source::Missing KPM_NAME metadata"
-              exit 1
-            }
-            grep -q 'KPM_INIT(' "$source" || {
-              echo "::error file=$source::Missing KPM_INIT entry point"
-              exit 1
-            }
+            for macro in KPM_NAME KPM_VERSION KPM_LICENSE KPM_INIT KPM_EXIT; do
+              grep -q "${macro}(" "$source" || {
+                echo "::error file=$source::Missing ${macro} metadata or entry point"
+                exit 1
+              }
+            done
           done <<< "$installable"
+
+      - name: Write validation summary
+        run: |
+          installable=$(node -p "require('./kpm_repo.json').modules.length")
+          drafts=$(node -p "require('./drafts.json').drafts.length")
+          {
+            echo '## PatchNest KPM catalog validation'
+            echo
+            echo "- Installable modules: ${installable}"
+            echo "- Isolated drafts: ${drafts}"
+            echo '- Catalog schema: version 2'
+            echo '- Release assets: source/tag/hash verification passed'
+          } >> "$GITHUB_STEP_SUMMARY"
