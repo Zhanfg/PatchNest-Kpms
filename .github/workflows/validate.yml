@@ -1,0 +1,48 @@
+name: Validate KPM catalog
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches:
+      - main
+      - restart/rebuild-catalog
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+
+      - name: Validate catalog and draft inventory
+        run: node scripts/validate.js
+
+      - name: Reject installable Linux-module sources
+        run: |
+          set -euo pipefail
+          installable=$(node -e "for (const m of require('./kpm_repo.json').modules) console.log(m.source || '')")
+          while IFS= read -r source; do
+            [ -z "$source" ] && continue
+            if grep -Eq 'module_init\(|module_exit\(|MODULE_LICENSE\(' "$source"; then
+              echo "::error file=$source::Installable entries must use KernelPatch KPM interfaces, not Linux module_init/module_exit"
+              exit 1
+            fi
+            grep -q 'KPM_NAME(' "$source" || {
+              echo "::error file=$source::Missing KPM_NAME metadata"
+              exit 1
+            }
+            grep -q 'KPM_INIT(' "$source" || {
+              echo "::error file=$source::Missing KPM_INIT entry point"
+              exit 1
+            }
+          done <<< "$installable"
