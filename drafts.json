@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "upstreamSdk": {
+    "repository": "KernelSU-Next/KPatch-Next",
+    "commit": "0fe6d142266b80e5aa445a7ea1534f88a8f33a35"
+  },
+  "drafts": [
+    {
+      "id": "stealth-boot-spoofer",
+      "source": "module/kpms/boot_state_spoofer.c",
+      "status": "blocked-sdk-port",
+      "reason": "Linux kernel-module-style source; missing KernelPatch KPM metadata and entry points."
+    },
+    {
+      "id": "stealth-linker-redact",
+      "source": "module/kpms/linker_redaction.c",
+      "status": "blocked-sdk-port",
+      "reason": "Linux kernel-module-style source; missing KernelPatch KPM metadata and entry points."
+    },
+    {
+      "id": "stealth-module-hider",
+      "source": "module/kpms/module_name_hider.c",
+      "status": "blocked-sdk-port",
+      "reason": "Linux kernel-module-style source; missing KernelPatch KPM metadata and entry points."
+    },
+    {
+      "id": "stealth-mount-hide",
+      "source": "module/kpms/mount_hide.c",
+      "status": "blocked-sdk-port",
+      "reason": "Linux kernel-module-style source; missing KernelPatch KPM metadata and entry points."
+    },
+    {
+      "id": "stealth-proc-maps",
+      "source": "module/kpms/proc_maps_hide.c",
+      "status": "blocked-sdk-port",
+      "reason": "Linux kernel-module-style source; missing KernelPatch KPM metadata and entry points."
+    },
+    {
+      "id": "stealth-selinux-faker",
+      "source": "module/kpms/selinux_context_faker.c",
+      "status": "blocked-sdk-port",
+      "reason": "Linux kernel-module-style source; missing KernelPatch KPM metadata and entry points."
+    }
+  ]
+}
