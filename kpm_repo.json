@@ -1,7 +1,9 @@
 {
   "name": "PatchNest Official KPM Repository",
   "description": "Verified KPM releases for PatchNest. Draft prototypes are excluded until they compile against the pinned KernelPatch KPM SDK and pass device validation.",
-  "version": 1,
+  "version": 2,
+  "repository": "Zhanfg/PatchNest-Kpms",
+  "catalogUrl": "https://raw.githubusercontent.com/Zhanfg/PatchNest-Kpms/main/kpm_repo.json",
   "updatedAt": "2026-08-06",
   "modules": []
 }
