@@ -26,6 +26,9 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Run offline catalog contract tests
+        run: node scripts/test-contract.js
+
       - name: Validate catalog and draft inventory
         run: node scripts/validate.js
 
@@ -70,5 +73,6 @@ jobs:
             echo "- Installable modules: ${installable}"
             echo "- Isolated drafts: ${drafts}"
             echo '- Catalog schema: version 2'
+            echo '- Offline contract fixtures: passed'
             echo '- Release assets: source/tag/hash verification passed'
           } >> "$GITHUB_STEP_SUMMARY"
