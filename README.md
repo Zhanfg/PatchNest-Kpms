@@ -1,74 +1,61 @@
-# Kpm-Repo
+# PatchNest KPM Repository
 
-Official KPatch Module (KPM) catalog for [KPatch-Next](https://github.com/Zhanfg/KPatch-Next-Module).
+Official KPM catalog and source workspace for [`PatchNest-Module`](https://github.com/Zhanfg/PatchNest-Module).
 
-The KPatch-Next WebUI's **Kpm-Repo** page subscribes to this repository by default and lists the modules declared in `kpm_repo.json`. Users can add additional repositories (forks, third-party catalogs) through the WebUI's "Manage repositories" dialog.
+## Current status
 
-## Layout
+The public catalog is intentionally empty while the existing six source files are being ported from Linux kernel-module-style prototypes to the KernelPatch KPM SDK.
 
-- `kpm_repo.json` — the catalog consumed by the WebUI. See schema below.
-- `module/kpms/*.c` — the C source for the prebuilt KPM modules listed in the catalog. These are the same sources that are compiled into `.kpm` binaries and shipped as release artifacts in [Zhanfg/KPatch-Next-Module](https://github.com/Zhanfg/KPatch-Next-Module/releases).
-- `webroot/index.html` — a static HTML rendering of the catalog for users who prefer to browse modules without the KPatch WebUI.
+The previous catalog contained placeholder or nonexistent downloads, including `example.com` URLs and assets under the retired `KPatch-Next-Module` name. Those entries have been removed so PatchNest no longer offers broken or unverified installations.
 
-## Catalog schema
-
-`kpm_repo.json` is a JSON object:
-
-```json
-{
-  "name": "Repository display name shown in the WebUI",
-  "description": "Repository description shown in the WebUI",
-  "version": 1,
-  "modules": [
-    {
-      "id": "unique-module-id",
-      "name": "Human-readable module name",
-      "version": "1.0.0",
-      "author": "github-username",
-      "description": "What the module does",
-      "downloadUrl": "https://github.com/Zhanfg/KPatch-Next-Module/releases/download/vX.Y.Z/module-id-1.0.0.kpm",
-      "minKpVersion": "0.13.5",
-      "size": 8192,
-      "signatureRequired": true,
-      "category": "anti-detect",
-      "targets": ["Memory", "Mount", "SELinux"],
-      "tags": ["stealth", "anti-detect"]
-    }
-  ]
-}
+```text
+https://raw.githubusercontent.com/Zhanfg/PatchNest-Kpms/main/kpm_repo.json
 ```
 
-### Field reference
+An empty `modules` array is valid. PatchNest WebUI will display that no verified modules are currently available.
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `id` | yes | Unique identifier across the catalog. Must match the KPM's `id` field in its own `module.prop`. |
-| `name` | yes | Human-readable name shown in the WebUI. |
-| `version` | yes | Semver string. The WebUI compares it against the installed module's version to detect updates. |
-| `author` | yes | Display name. Typically a GitHub username. |
-| `description` | yes | One-paragraph description shown on the module card. |
-| `downloadUrl` | yes | Direct HTTPS URL to a `.kpm.zip` (or `.kpm`) file. The WebUI's installer downloads this URL, then runs `install_kpm.sh` on the downloaded archive. **Must be HTTPS** — the URL sanitizer in the WebUI rejects `http://` and other schemes. |
-| `minKpVersion` | yes | Minimum KPatch version required. The WebUI displays a warning if the user is below this version. |
-| `size` | no | Display-only — the on-disk size of the download in bytes. |
-| `signatureRequired` | no | Hint to the WebUI; the actual signing verification is performed by the installer (`install_kpm.sh`) and KPM signature checker (`kpm_verify.sh`). |
-| `category` | no | Display-only. The WebUI does not filter by this; it's used by maintainers for grouping. |
-| `targets` | no | Display-only — the names of the duck-detector signal cards the module defends against. |
-| `tags` | no | Display-only — search-friendly keywords. |
+## Repository layout
 
-## Adding a new module
+```text
+kpm_repo.json          Verified, installable catalog only
+drafts.json            Inventory and porting status of non-release prototypes
+module/kpms/*.c         Existing prototype sources
+scripts/validate.js     Catalog and draft consistency checks
+.github/workflows/      Validation pipeline
+AUDIT.md                Restart audit and release gates
+```
 
-1. Drop the KPM source in `module/kpms/<id>.c` (or in a subdirectory).
-2. Add an entry to the `modules` array in `kpm_repo.json`.
-3. Build the KPM (see [KPatch-Next's CI workflow](https://github.com/Zhanfg/KPatch-Next-Module/blob/main/.github/workflows/build.yaml)) and attach the `.kpm` artifact to a release in KPatch-Next-Module.
-4. Set `downloadUrl` in your catalog entry to the release asset URL.
-5. Open a PR with the catalog change.
+## Release policy
 
-The WebUI pulls this repository on every cold start (and re-pulls on user-initiated refresh from the Kpm-Repo page), so the new module becomes available to all users within one refresh cycle.
+A module may enter `kpm_repo.json` only when all of the following are true:
 
-## Repository override
+1. It uses KernelPatch KPM metadata and entry points such as `KPM_NAME`, `KPM_VERSION`, `KPM_INIT`, and `KPM_EXIT`.
+2. It builds against a pinned KernelPatch KPM SDK commit.
+3. The produced file is an ARM64 KPM artifact, not a Linux `.ko` module.
+4. The release asset has a 64-character SHA-256 recorded in the catalog.
+5. The download URL is a real HTTPS GitHub Release asset.
+6. Load, control, unload, reboot persistence, and failure recovery have been tested on a supported device.
 
-Users can add their own repository URLs in the WebUI under **Settings → Manage repositories**, and the maintainer of a custom KPatch-Next build can hard-code a different default URL via `/data/adb/kp-next/repos.json`. See the KPatch-Next documentation for details.
+## Catalog contract
+
+Every installable module must include:
+
+- `id`
+- `name`
+- `version`
+- `author`
+- `description`
+- `downloadUrl`
+- `sha256`
+- `minKpVersion`
+- `minPatchNestVersion`
+- `sourceCommit`
+- `testedKernelRanges`
+- `signatureRequired`
+- `channel`
+
+`channel` is either `experimental` or `stable`. Draft prototypes never appear in the installable catalog.
 
 ## License
 
-Same license as KPatch-Next (GPLv2 or later, see upstream).
+Source files retain their declared licenses and upstream copyright notices. A module without a confirmed compatible license cannot be released through the catalog.
