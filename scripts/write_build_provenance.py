@@ -6,10 +6,12 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def sha256(path: Path) -> str:
@@ -31,6 +33,22 @@ def git(*args: str) -> str:
     return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
 
 
+def require_sha(label: str, value: str) -> None:
+    if not SHA_RE.fullmatch(value):
+        raise SystemExit(f"ERROR: {label} must be a full lowercase Git SHA")
+
+
+def require_ancestor(ancestor: str, descendant: str, label: str) -> None:
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"ERROR: {label} {ancestor} is not an ancestor of tested commit {descendant}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact", required=True)
@@ -49,18 +67,28 @@ def main() -> int:
     base_commit = env("PATCHNEST_BASE_COMMIT", required=False) or None
     checkout_head = git("rev-parse", "HEAD")
     expected_checkout = env("GITHUB_SHA")
+    for label, value in (("sourceHeadCommit", source_head), ("testedCommit", checkout_head), ("GITHUB_SHA", expected_checkout)):
+        require_sha(label, value)
     if checkout_head != expected_checkout:
         raise SystemExit(f"ERROR: checkout HEAD {checkout_head} != GITHUB_SHA {expected_checkout}")
 
     is_pr = event_name == "pull_request"
     tested_merge = checkout_head if is_pr else None
-    if is_pr and not base_commit:
-        raise SystemExit("ERROR: pull_request provenance requires base commit")
-    if not is_pr and base_commit is not None:
-        raise SystemExit("ERROR: non-PR provenance must not invent a base commit")
+    if is_pr:
+        if not base_commit:
+            raise SystemExit("ERROR: pull_request provenance requires base commit")
+        require_sha("baseCommit", base_commit)
+        require_ancestor(source_head, checkout_head, "source head")
+        require_ancestor(base_commit, checkout_head, "base commit")
+    else:
+        if base_commit is not None:
+            raise SystemExit("ERROR: non-PR provenance must not invent a base commit")
+        if source_head != checkout_head:
+            raise SystemExit("ERROR: non-PR sourceHeadCommit must equal testedCommit")
 
     input_manifest = json.loads(inputs.read_text(encoding="utf-8"))
-    if input_manifest.get("artifactSha256") != sha256(artifact):
+    artifact_digest = sha256(artifact)
+    if input_manifest.get("artifactSha256") != artifact_digest:
         raise SystemExit("ERROR: build-input manifest artifact digest mismatch")
 
     provenance = {
@@ -75,7 +103,7 @@ def main() -> int:
         "testedMergeCommit": tested_merge,
         "sourceTreeStatusAtCheckout": env("PATCHNEST_SOURCE_TREE_STATUS"),
         "artifact": artifact.name,
-        "artifactSha256": sha256(artifact),
+        "artifactSha256": artifact_digest,
         "artifactSize": artifact.stat().st_size,
         "buildInputsManifest": inputs.name,
         "buildInputsSha256": sha256(inputs),
