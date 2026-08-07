@@ -38,25 +38,28 @@ def sha256(path: Path) -> str:
 
 def load_metadata() -> dict:
     data = json.loads(META.read_text(encoding="utf-8"))
-    if data.get("id") != "patchnest-diagnostic-hello":
-        fail("unexpected module id")
+    if data.get("id") != "patchnest-diagnostic-hello": fail("unexpected module id")
     if data.get("installable") is not False or data.get("channel") != "build-only":
         fail("diagnostic module must remain build-only/non-installable")
     build = data.get("build")
     required = ("sources", "objects", "linkerScript", "depfiles", "mapFile", "allowedUndefinedSymbols")
     if not isinstance(build, dict) or any(key not in build for key in required):
         fail("incomplete module.json build declaration")
+    symbols = build["allowedUndefinedSymbols"]
+    if not isinstance(symbols, list) or not symbols or any(
+        not isinstance(s, str) or not re.fullmatch(r"[A-Za-z0-9_.$]+", s) for s in symbols
+    ):
+        fail("allowedUndefinedSymbols must be a non-empty exact-name list")
     return data
 
 
 def make_words(text: str, variable: str) -> list[str]:
     match = re.search(rf"^{re.escape(variable)}\s*:?=\s*(.+)$", text, re.M)
-    if not match:
-        fail(f"Makefile {variable} assignment missing")
+    if not match: fail(f"Makefile {variable} assignment missing")
     return match.group(1).split()
 
 
-def validate_source() -> dict:
+def validate_source(*, allow_generated: bool = False) -> dict:
     data = load_metadata()
     build = data["build"]
     text = MAKEFILE.read_text(encoding="utf-8")
@@ -74,42 +77,37 @@ def validate_source() -> dict:
 
     lowered = text.lower()
     for token in PROHIBITED_BUILD_TOKENS:
-        if token.lower() in lowered:
-            fail(f"undeclared network/generator command in module Makefile: {token!r}")
+        if token.lower() in lowered: fail(f"undeclared network/generator command in Makefile: {token!r}")
 
     compile_lines = [line.strip() for line in text.splitlines() if " -c " in line]
     link_lines = [line.strip() for line in text.splitlines() if "$(CC) -r " in line]
-    if len(compile_lines) != 1 or len(link_lines) != 1:
-        fail("expected exactly one compile and one final relocatable link command")
+    recipes = [line.strip() for line in text.splitlines() if line.startswith("\t")]
+    if len(compile_lines) != 1 or len(link_lines) != 1: fail("expected one compile and one final link")
     compile_line, link_line = compile_lines[0], link_lines[0]
-    if "-T" in compile_line or "-Wl,-T" in compile_line:
-        fail("linker script passed during compilation")
-    if "-MMD" not in compile_line or "-MF diagnostic_hello.d" not in compile_line:
-        fail("compile command does not emit declared depfile")
-    if "-Wl,-T,$(LINKER_SCRIPT)" not in link_line:
-        fail("final link does not apply linker script")
-    if "-Wl,-Map,$(MAP_FILE)" not in link_line:
-        fail("final link does not emit map")
-    if "$(OBJECTS)" not in link_line:
-        fail("final link does not consume declared OBJECTS")
+    clean_line = "rm -f $(OBJECTS) $(DEPFILES) $(MAP_FILE) $(TARGET)"
+    if recipes != [link_line, compile_line, clean_line]:
+        fail("module Makefile contains undeclared recipe commands")
+    if "-T" in compile_line or "-Wl,-T" in compile_line: fail("linker script passed during compilation")
+    if "-MMD" not in compile_line or "-MF diagnostic_hello.d" not in compile_line: fail("depfile emission missing")
+    if "-Wl,-T,$(LINKER_SCRIPT)" not in link_line: fail("final link does not apply linker script")
+    if "-Wl,-Map,$(MAP_FILE)" not in link_line: fail("final link does not emit map")
+    if "$(OBJECTS)" not in link_line: fail("final link does not consume declared OBJECTS")
 
     declared = {(ROOT / p).resolve() for p in sources + [linker]}
+    generated_objects = {(MODULE / p).resolve() for p in objects}
     for item in MODULE.iterdir():
-        if not item.is_file() or item.suffix not in INPUT_SUFFIXES:
-            continue
-        if item.suffix in {".o", ".a"}:  # generated outputs are checked post-build
-            continue
-        if item.resolve() not in declared:
-            fail(f"undeclared local compilation input: {item.relative_to(ROOT)}")
+        if not item.is_file() or item.suffix not in INPUT_SUFFIXES: continue
+        resolved = item.resolve()
+        if resolved in declared: continue
+        if allow_generated and resolved in generated_objects: continue
+        fail(f"undeclared/prebuilt compilation input: {item.relative_to(ROOT)}")
 
     for source in sources:
         path = (ROOT / source).resolve()
-        if not path.is_file() or ROOT not in path.parents:
-            fail(f"declared source missing/outside repository: {source}")
+        if not path.is_file() or ROOT not in path.parents: fail(f"source missing/outside repository: {source}")
         source_text = path.read_text(encoding="utf-8")
         for pattern in PROHIBITED_SOURCE:
-            if re.search(pattern, source_text, re.I):
-                fail(f"prohibited diagnostic token {pattern!r} in {source}")
+            if re.search(pattern, source_text, re.I): fail(f"prohibited token {pattern!r} in {source}")
     primary = (ROOT / sources[0]).read_text(encoding="utf-8")
     for required in ("KPM_NAME(", "KPM_VERSION(", "KPM_INIT(", "KPM_EXIT("):
         if required not in primary: fail(f"missing {required}")
@@ -144,14 +142,13 @@ def undefined_symbols(readelf: str, artifact: Path) -> set[str]:
 
 def validate_artifact(readelf: str, output: Path) -> dict:
     data = load_metadata()
-    validate_source()
+    validate_source(allow_generated=True)
     build = data["build"]
     artifact = MODULE / data["artifact"]
     map_path = MODULE / str(build["mapFile"])
     depfiles = [MODULE / str(item) for item in build["depfiles"]]
     for path in [artifact, map_path, *depfiles]:
-        if not path.is_file() or path.stat().st_size == 0:
-            fail(f"required build output missing/empty: {path.relative_to(ROOT)}")
+        if not path.is_file() or path.stat().st_size == 0: fail(f"missing/empty: {path.relative_to(ROOT)}")
 
     allowed = {str(x) for x in build["allowedUndefinedSymbols"]}
     actual = undefined_symbols(readelf, artifact)
@@ -161,23 +158,17 @@ def validate_artifact(readelf: str, output: Path) -> dict:
     inputs: dict[str, dict[str, object]] = {}
     for depfile in depfiles:
         for path in depfile_paths(depfile):
-            try:
-                display, origin = str(path.relative_to(ROOT)), "repository"
-            except ValueError:
-                display, origin = str(path), "sdk"
+            try: display, origin = str(path.relative_to(ROOT)), "repository"
+            except ValueError: display, origin = str(path), "sdk"
             inputs[display] = {"origin": origin, "sha256": sha256(path), "size": path.stat().st_size}
-    linker = ROOT / str(build["linkerScript"])
-    inputs[str(linker.relative_to(ROOT))] = {
-        "origin": "repository", "sha256": sha256(linker), "size": linker.stat().st_size,
+    linker_path = ROOT / str(build["linkerScript"])
+    inputs[str(linker_path.relative_to(ROOT))] = {
+        "origin": "repository", "sha256": sha256(linker_path), "size": linker_path.stat().st_size,
     }
-
     manifest = {
-        "schemaVersion": 1,
-        "artifact": str(artifact.relative_to(ROOT)),
-        "artifactSha256": sha256(artifact),
-        "mapSha256": sha256(map_path),
-        "undefinedSymbols": sorted(actual),
-        "allowedUndefinedSymbols": sorted(allowed),
+        "schemaVersion": 1, "artifact": str(artifact.relative_to(ROOT)),
+        "artifactSha256": sha256(artifact), "mapSha256": sha256(map_path),
+        "undefinedSymbols": sorted(actual), "allowedUndefinedSymbols": sorted(allowed),
         "inputs": dict(sorted(inputs.items())),
     }
     output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
