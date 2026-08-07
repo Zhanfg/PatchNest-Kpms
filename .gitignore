@@ -1,9 +1,12 @@
 # Build artifacts
 *.o
 *.obj
+*.d
+*.map
 *.kpm
 *.kpm.zip
 *.so
+build-reports/
 
 # Editor / OS
 .DS_Store

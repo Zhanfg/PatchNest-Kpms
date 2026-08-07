@@ -1,0 +1,272 @@
+name: Build diagnostic KPM
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches:
+      - main
+      - fix/diagnostic-build-integrity
+  workflow_dispatch:
+
+concurrency:
+  group: diagnostic-kpm-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KP_REPOSITORY: KernelSU-Next/KPatch-Next
+  KP_COMMIT: 0fe6d142266b80e5aa445a7ea1534f88a8f33a35
+  ARM_TOOLCHAIN_URL: https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+  ARM_TOOLCHAIN_SHA256: 62d66e0ad7bd7f2a183d236ee301a5c73c737c886c7944aa4f39415aab528daf
+  MODULE_DIR: modules/diagnostic-hello
+  REPORT_DIR: build-reports/diagnostic-hello
+  ARTIFACT_NAME: patchnest-diagnostic-hello.kpm
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout tested revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Record source and checkout identity
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          tested_checkout=$(git rev-parse HEAD)
+          source_head="$GITHUB_SHA"
+          base_commit=""
+          tested_merge=""
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            source_head="$PR_HEAD_SHA"
+            base_commit="$PR_BASE_SHA"
+            tested_merge="$tested_checkout"
+          fi
+          test -n "$source_head"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            test -n "$base_commit"
+            test -n "$tested_merge"
+          fi
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            echo '::error::Checkout is dirty before build'
+            exit 1
+          fi
+          {
+            echo "SOURCE_HEAD_COMMIT=$source_head"
+            echo "BASE_COMMIT=$base_commit"
+            echo "TESTED_CHECKOUT_COMMIT=$tested_checkout"
+            echo "TESTED_MERGE_COMMIT=$tested_merge"
+            echo "SOURCE_TREE_DIRTY_BEFORE_BUILD=false"
+          } >> "$GITHUB_ENV"
+
+      - name: Validate catalog and complete build graph
+        run: node scripts/validate.js
+
+      - name: Capture declared source inputs
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          node - <<'NODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const metadata = JSON.parse(fs.readFileSync('modules/diagnostic-hello/module.json', 'utf8'));
+          const inputs = metadata.build.declaredInputs.map((file) => {
+            const data = fs.readFileSync(file);
+            return {
+              path: file,
+              sha256: crypto.createHash('sha256').update(data).digest('hex'),
+              size: data.length,
+            };
+          });
+          fs.writeFileSync(
+            'build-reports/diagnostic-hello/source-inputs.json',
+            JSON.stringify({inputs}, null, 2) + '\n',
+          );
+          NODE
+
+      - name: Clone pinned KernelPatch SDK
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout \
+            "https://github.com/${KP_REPOSITORY}.git" "$RUNNER_TEMP/kpatch-next"
+          git -C "$RUNNER_TEMP/kpatch-next" checkout --detach "$KP_COMMIT"
+          test "$(git -C "$RUNNER_TEMP/kpatch-next" rev-parse HEAD)" = "$KP_COMMIT"
+          test -f "$RUNNER_TEMP/kpatch-next/kernel/include/kpmodule.h"
+
+      - name: Download and verify Arm toolchain
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/arm-toolchain.tar.xz"
+          root="$RUNNER_TEMP/arm-toolchain"
+          curl -fL --retry 3 --retry-delay 2 "$ARM_TOOLCHAIN_URL" -o "$archive"
+          echo "$ARM_TOOLCHAIN_SHA256  $archive" | sha256sum -c -
+          mkdir -p "$root"
+          tar -xf "$archive" -C "$root"
+          prefix="$root/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-"
+          test -x "${prefix}gcc"
+          echo "TARGET_COMPILE=$prefix" >> "$GITHUB_ENV"
+
+      - name: Record and execute declared build graph
+        run: |
+          set -euo pipefail
+          make -C "$MODULE_DIR" clean
+          make -C "$MODULE_DIR" \
+            TARGET_COMPILE="$TARGET_COMPILE" \
+            KP_DIR="$RUNNER_TEMP/kpatch-next" \
+            print-build-graph | tee "$REPORT_DIR/build-graph.txt"
+          make -C "$MODULE_DIR" \
+            TARGET_COMPILE="$TARGET_COMPILE" \
+            KP_DIR="$RUNNER_TEMP/kpatch-next" \
+            -n all | tee "$REPORT_DIR/build-commands.txt"
+          make -C "$MODULE_DIR" \
+            TARGET_COMPILE="$TARGET_COMPILE" \
+            KP_DIR="$RUNNER_TEMP/kpatch-next" \
+            all
+          test -s "$MODULE_DIR/$ARTIFACT_NAME"
+          test -s "$MODULE_DIR/patchnest-diagnostic-hello.map"
+          test -s "$MODULE_DIR/diagnostic_hello.d"
+          test -s "$MODULE_DIR/diagnostic_hello.o"
+
+      - name: Verify generated-file allowlist
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const metadata = JSON.parse(fs.readFileSync('modules/diagnostic-hello/module.json', 'utf8'));
+          const allowed = new Set([...metadata.build.declaredInputs, ...metadata.build.generatedOutputs]);
+          const root = 'modules/diagnostic-hello';
+          const walk = (dir) => fs.readdirSync(dir, {withFileTypes: true}).flatMap((entry) => {
+            const file = path.posix.join(dir, entry.name);
+            return entry.isDirectory() ? walk(file) : [file];
+          });
+          const unexpected = walk(root).filter((file) => !allowed.has(file));
+          if (unexpected.length) {
+            throw new Error(`undeclared files produced by build: ${unexpected.join(', ')}`);
+          }
+          for (const expected of metadata.build.generatedOutputs) {
+            if (!fs.existsSync(expected)) throw new Error(`missing declared output: ${expected}`);
+          }
+          NODE
+
+      - name: Inspect relocatable ARM64 artifact
+        run: |
+          set -euo pipefail
+          artifact="$MODULE_DIR/$ARTIFACT_NAME"
+          description=$(file "$artifact")
+          echo "$description" | tee "$REPORT_DIR/file.txt"
+          printf '%s' "$description" | grep -q 'ELF 64-bit'
+
+          readelf -h "$artifact" | tee "$REPORT_DIR/elf-header.txt"
+          readelf -SW "$artifact" | tee "$REPORT_DIR/sections.txt"
+          readelf -sW "$artifact" | tee "$REPORT_DIR/symbols.txt"
+          readelf -rW "$artifact" | tee "$REPORT_DIR/relocations.txt"
+
+          readelf -h "$artifact" | grep -Eq 'Type:[[:space:]]+REL'
+          readelf -h "$artifact" | grep -Eq 'Machine:[[:space:]]+AArch64'
+          strings "$artifact" | grep -Fx 'name=patchnest-diagnostic-hello'
+          strings "$artifact" | grep -Fx 'version=0.1.0'
+          strings "$artifact" | grep -Fx 'patchnest-diagnostic-ok'
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          lines = Path('build-reports/diagnostic-hello/sections.txt').read_text().splitlines()
+          pattern = re.compile(
+              r'^\s*\[\s*\d+\]\s+\S+\s+\S+\s+'
+              r'[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+'
+              r'\S+\s+(\S*)'
+          )
+          for line in lines:
+              match = pattern.match(line)
+              if not match:
+                  continue
+              flags = match.group(1)
+              if 'W' in flags and 'X' in flags:
+                  raise SystemExit(f'writable-executable KPM section: {line}')
+          PY
+
+          if grep -Eq 'R_AARCH64_(JUMP_SLOT|GLOB_DAT)' "$REPORT_DIR/relocations.txt"; then
+            echo '::error::Unexpected dynamic-linker relocation in KPM'
+            exit 1
+          fi
+
+          for section in '.kpm.info' '.kpm.init' '.kpm.ctl0' '.kpm.exit'; do
+            grep -F "$section" "$MODULE_DIR/patchnest-diagnostic-hello.map" >/dev/null || {
+              echo "::error::Link map missing required section $section"
+              exit 1
+            }
+          done
+
+      - name: Enforce final ELF symbol allowlist
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const metadata = JSON.parse(fs.readFileSync('modules/diagnostic-hello/module.json', 'utf8'));
+          const allowed = new Set(metadata.build.allowedUndefinedSymbols);
+          const symbols = fs.readFileSync('build-reports/diagnostic-hello/symbols.txt', 'utf8');
+          const undefinedSymbols = new Set();
+          for (const line of symbols.split('\n')) {
+            const match = line.match(/\bUND\b\s+(\S+)\s*$/);
+            if (match) undefinedSymbols.add(match[1].replace(/@.*$/, ''));
+          }
+          const unexpected = [...undefinedSymbols].filter((symbol) => !allowed.has(symbol)).sort();
+          if (unexpected.length) {
+            throw new Error(`unexpected undefined ELF symbols: ${unexpected.join(', ')}`);
+          }
+          const combined = symbols + '\n' + fs.readFileSync('build-reports/diagnostic-hello/relocations.txt', 'utf8');
+          const prohibited = [
+            /hook_wrap/i,
+            /fp_hook/i,
+            /syscall_hook/i,
+            /kallsyms_lookup/i,
+            /selinux/i,
+            /proc_maps/i,
+            /boot_state/i,
+            /module_hide/i,
+          ];
+          for (const pattern of prohibited) {
+            if (pattern.test(combined)) throw new Error(`prohibited final-ELF symbol/relocation marker: ${pattern}`);
+          }
+          fs.writeFileSync(
+            'build-reports/diagnostic-hello/undefined-symbols.json',
+            JSON.stringify({allowed: [...allowed].sort(), observed: [...undefinedSymbols].sort()}, null, 2) + '\n',
+          );
+          NODE
+
+      - name: Capture object and dependency evidence
+        run: |
+          set -euo pipefail
+          cp "$MODULE_DIR/diagnostic_hello.d" "$REPORT_DIR/diagnostic_hello.d"
+          cp "$MODULE_DIR/patchnest-diagnostic-hello.map" "$REPORT_DIR/patchnest-diagnostic-hello.map"
+          {
+            sha256sum "$MODULE_DIR/diagnostic_hello.o"
+            sha256sum "$MODULE_DIR/$ARTIFACT_NAME"
+            sha256sum "$MODULE_DIR/patchnest-diagnostic-hello.map"
+          } > "$REPORT_DIR/build-output-sha256.txt"
+
+      - name: Generate provenance manifest
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          node scripts/generate-provenance.js
+
+      - name: Upload build-only diagnostic artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: diagnostic-kpm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            modules/diagnostic-hello/patchnest-diagnostic-hello.kpm
+            build-reports/diagnostic-hello/
+          if-no-files-found: error
+          retention-days: 14

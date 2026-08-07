@@ -10,6 +10,7 @@ on:
     branches:
       - main
       - restart/rebuild-catalog
+      - fix/diagnostic-build-integrity
   workflow_dispatch:
 
 jobs:
@@ -24,8 +25,20 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Validate catalog and draft inventory
+      - name: Validate catalog drafts and complete candidate build graphs
         run: node scripts/validate.js
+
+      - name: Validate reachable diagnostic Make build plan
+        run: node scripts/validate-diagnostic-build-plan.js
+
+      - name: Run build-policy bypass fixtures
+        run: node tests/validate-build-policy.js
+
+      - name: Reject hidden Make prerequisites and recipes
+        run: node tests/diagnostic-build-plan.test.js
+
+      - name: Validate provenance identity schema
+        run: node tests/provenance.test.js
 
       - name: Reject installable Linux-module sources
         run: |
