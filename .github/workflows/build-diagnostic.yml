@@ -30,39 +30,51 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
 
-      - name: Validate build-only metadata and source scope
+      - name: Validate catalog and closed diagnostic build graph
         run: |
           set -euo pipefail
+          node scripts/validate.js
+          node scripts/validate-build-graph.js
           node - <<'NODE'
           const fs = require('node:fs');
           const metadata = JSON.parse(fs.readFileSync('modules/diagnostic-hello/module.json', 'utf8'));
-          if (metadata.id !== 'patchnest-diagnostic-hello') throw new Error('unexpected module id');
-          if (metadata.installable !== false || metadata.channel !== 'build-only') {
-            throw new Error('diagnostic module must remain build-only and non-installable');
-          }
           if (metadata.upstreamSdk.commit !== process.env.KP_COMMIT) {
             throw new Error('metadata SDK commit does not match workflow pin');
           }
-          const source = fs.readFileSync(metadata.source, 'utf8');
-          const prohibited = [
-            /hook_wrap/i,
-            /fp_hook/i,
-            /syscall_hook/i,
-            /kallsyms_lookup/i,
-            /selinux/i,
-            /mount/i,
-            /proc_maps/i,
-            /boot_state/i,
-            /module_hide/i,
-          ];
-          for (const pattern of prohibited) {
-            if (pattern.test(source)) throw new Error(`prohibited diagnostic capability: ${pattern}`);
-          }
-          for (const required of ['KPM_NAME(', 'KPM_VERSION(', 'KPM_INIT(', 'KPM_EXIT(']) {
-            if (!source.includes(required)) throw new Error(`missing ${required}`);
+          if (metadata.installable !== false || metadata.channel !== 'build-only') {
+            throw new Error('diagnostic module must remain build-only and non-installable');
           }
           NODE
+
+      - name: Capture immutable source identity
+        env:
+          SOURCE_HEAD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_COMMIT: ${{ github.event.pull_request.base.sha || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY_NAME: ${{ github.repository }}
+          WORKFLOW_REF_VALUE: ${{ github.workflow_ref }}
+          RUN_ID_VALUE: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          git diff --quiet HEAD --
+          git diff --cached --quiet
+          tested_commit=$(git rev-parse HEAD)
+          git cat-file -e "${SOURCE_HEAD_COMMIT}^{commit}"
+          if [ -n "$BASE_COMMIT" ]; then
+            git cat-file -e "${BASE_COMMIT}^{commit}"
+          fi
+          {
+            echo "PATCHNEST_SOURCE_HEAD_COMMIT=$SOURCE_HEAD_COMMIT"
+            echo "PATCHNEST_BASE_COMMIT=$BASE_COMMIT"
+            echo "PATCHNEST_TESTED_COMMIT=$tested_commit"
+            echo "PATCHNEST_EVENT_NAME=$EVENT_NAME"
+            echo "PATCHNEST_REPOSITORY=$REPOSITORY_NAME"
+            echo "PATCHNEST_WORKFLOW_REF=$WORKFLOW_REF_VALUE"
+            echo "PATCHNEST_RUN_ID=$RUN_ID_VALUE"
+          } >> "$GITHUB_ENV"
 
       - name: Clone pinned KernelPatch SDK
         run: |
@@ -94,8 +106,9 @@ jobs:
             TARGET_COMPILE="$TARGET_COMPILE" \
             KP_DIR="$RUNNER_TEMP/kpatch-next"
           test -s "$MODULE_DIR/$ARTIFACT_NAME"
+          test -s "$MODULE_DIR/patchnest-diagnostic-hello.map"
 
-      - name: Inspect relocatable ARM64 artifact
+      - name: Inspect relocatable ARM64 artifact and symbol allowlist
         run: |
           set -euo pipefail
           artifact="$MODULE_DIR/$ARTIFACT_NAME"
@@ -107,6 +120,8 @@ jobs:
           readelf -SW "$artifact" | tee "$MODULE_DIR/sections.txt"
           readelf -sW "$artifact" | tee "$MODULE_DIR/symbols.txt"
           readelf -rW "$artifact" | tee "$MODULE_DIR/relocations.txt"
+          readelf -Ws "$artifact" | awk '$7 == "UND" && $8 != "" {print $8}' | sort -u \
+            > "$MODULE_DIR/undefined-symbols.txt"
 
           readelf -h "$artifact" | grep -Eq 'Type:[[:space:]]+REL'
           readelf -h "$artifact" | grep -Eq 'Machine:[[:space:]]+AArch64'
@@ -115,10 +130,12 @@ jobs:
           strings "$artifact" | grep -Fx 'patchnest-diagnostic-ok'
 
           python3 - <<'PY'
+          import json
           import re
           from pathlib import Path
 
-          lines = Path('modules/diagnostic-hello/sections.txt').read_text().splitlines()
+          module = Path('modules/diagnostic-hello')
+          lines = (module / 'sections.txt').read_text().splitlines()
           pattern = re.compile(
               r'^\s*\[\s*\d+\]\s+\S+\s+\S+\s+'
               r'[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+'
@@ -126,11 +143,15 @@ jobs:
           )
           for line in lines:
               match = pattern.match(line)
-              if not match:
-                  continue
-              flags = match.group(1)
-              if 'W' in flags and 'X' in flags:
+              if match and 'W' in match.group(1) and 'X' in match.group(1):
                   raise SystemExit(f'writable-executable KPM section: {line}')
+
+          metadata = json.loads((module / 'module.json').read_text())
+          allowed = set(metadata['buildGraph']['allowedUndefinedSymbols'])
+          actual = {line.strip() for line in (module / 'undefined-symbols.txt').read_text().splitlines() if line.strip()}
+          unexpected = sorted(actual - allowed)
+          if unexpected:
+              raise SystemExit('unexpected undefined symbols: ' + ', '.join(unexpected))
           PY
 
           if grep -Eq 'R_AARCH64_(JUMP_SLOT|GLOB_DAT)' "$MODULE_DIR/relocations.txt"; then
@@ -138,26 +159,68 @@ jobs:
             exit 1
           fi
 
-      - name: Generate provenance manifest
+      - name: Generate reproducible provenance manifest
         run: |
           set -euo pipefail
-          artifact="$MODULE_DIR/$ARTIFACT_NAME"
-          sha=$(sha256sum "$artifact" | awk '{print $1}')
-          size=$(stat -c '%s' "$artifact")
-          cat > "$MODULE_DIR/build-provenance.json" <<EOF
-          {
-            "artifact": "$ARTIFACT_NAME",
-            "sha256": "$sha",
-            "size": $size,
-            "sourceCommit": "$GITHUB_SHA",
-            "sdkRepository": "$KP_REPOSITORY",
-            "sdkCommit": "$KP_COMMIT",
-            "toolchain": "arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf",
-            "toolchainSha256": "$ARM_TOOLCHAIN_SHA256",
-            "installable": false,
-            "deviceValidated": false
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          module = Path('modules/diagnostic-hello')
+          metadata = json.loads((module / 'module.json').read_text())
+          artifact = module / os.environ['ARTIFACT_NAME']
+          map_file = module / metadata['buildGraph']['mapFile']
+
+          def digest(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          declared = [
+              {'path': item, 'sha256': digest(Path(item))}
+              for item in metadata['buildGraph']['declaredInputs']
+          ]
+          objects = [
+              {'path': str(module / item), 'sha256': digest(module / item)}
+              for item in metadata['buildGraph']['objects']
+          ]
+          undefined = [
+              line.strip() for line in (module / 'undefined-symbols.txt').read_text().splitlines()
+              if line.strip()
+          ]
+          base = os.environ.get('PATCHNEST_BASE_COMMIT') or None
+          provenance = {
+              'schemaVersion': 2,
+              'artifact': artifact.name,
+              'sha256': digest(artifact),
+              'size': artifact.stat().st_size,
+              'sourceHeadCommit': os.environ['PATCHNEST_SOURCE_HEAD_COMMIT'],
+              'baseCommit': base,
+              'testedMergeCommit': os.environ['PATCHNEST_TESTED_COMMIT'],
+              'sourceTreeStatus': 'clean',
+              'eventName': os.environ['PATCHNEST_EVENT_NAME'],
+              'repository': os.environ['PATCHNEST_REPOSITORY'],
+              'workflowRef': os.environ['PATCHNEST_WORKFLOW_REF'],
+              'runId': os.environ['PATCHNEST_RUN_ID'],
+              'sdkRepository': os.environ['KP_REPOSITORY'],
+              'sdkCommit': os.environ['KP_COMMIT'],
+              'toolchain': 'arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf',
+              'toolchainSha256': os.environ['ARM_TOOLCHAIN_SHA256'],
+              'declaredInputDigests': declared,
+              'objectDigests': objects,
+              'linkMap': {'path': str(map_file), 'sha256': digest(map_file)},
+              'undefinedSymbols': undefined,
+              'installable': False,
+              'deviceValidated': False,
           }
-          EOF
+          (module / 'build-provenance.json').write_text(
+              json.dumps(provenance, indent=2, sort_keys=True) + '\n'
+          )
+          PY
           cat "$MODULE_DIR/build-provenance.json"
 
       - name: Upload build-only diagnostic artifact
@@ -166,10 +229,12 @@ jobs:
           name: diagnostic-kpm-${{ github.sha }}
           path: |
             modules/diagnostic-hello/patchnest-diagnostic-hello.kpm
+            modules/diagnostic-hello/patchnest-diagnostic-hello.map
             modules/diagnostic-hello/build-provenance.json
             modules/diagnostic-hello/elf-header.txt
             modules/diagnostic-hello/sections.txt
             modules/diagnostic-hello/symbols.txt
             modules/diagnostic-hello/relocations.txt
+            modules/diagnostic-hello/undefined-symbols.txt
           if-no-files-found: error
           retention-days: 14
