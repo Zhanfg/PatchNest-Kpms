@@ -1,7 +1,14 @@
+TARGET := patchnest-diagnostic-hello.kpm
+SOURCE := diagnostic_hello.c
+OBJECTS := diagnostic_hello.o
+DEPFILES := diagnostic_hello.d
+LINKER_SCRIPT := diagnostic_hello.lds
+MAP_FILE := diagnostic_hello.map
+
+ifneq ($(filter clean,$(MAKECMDGOALS)),clean)
 ifndef TARGET_COMPILE
     $(error TARGET_COMPILE not set)
 endif
-
 ifndef KP_DIR
     $(error KP_DIR not set)
 endif
@@ -10,13 +17,7 @@ CC := $(TARGET_COMPILE)gcc
 INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 CFLAGS += -O2 -Wall -Wextra -Werror
-
-TARGET := patchnest-diagnostic-hello.kpm
-SOURCE := diagnostic_hello.c
-OBJECTS := diagnostic_hello.o
-DEPFILES := diagnostic_hello.d
-LINKER_SCRIPT := diagnostic_hello.lds
-MAP_FILE := diagnostic_hello.map
+endif
 
 all: $(TARGET)
 
