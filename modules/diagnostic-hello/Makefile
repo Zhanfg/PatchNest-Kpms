@@ -9,7 +9,7 @@ endif
 CC := $(TARGET_COMPILE)gcc
 INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
-CFLAGS += -O2 -Wall -Wextra -Werror=implicit-function-declaration -Werror=int-conversion -Werror=unused-command-line-argument
+CFLAGS += -O2 -Wall -Wextra -Werror
 
 TARGET := patchnest-diagnostic-hello.kpm
 SOURCE := diagnostic_hello.c
