@@ -12,160 +12,144 @@ on:
       - restart/verified-kpm-build
   workflow_dispatch:
 
-concurrency:
-  group: diagnostic-kpm-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  KP_REPOSITORY: KernelSU-Next/KPatch-Next
-  KP_COMMIT: 0fe6d142266b80e5aa445a7ea1534f88a8f33a35
-  ARM_TOOLCHAIN_URL: https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
-  ARM_TOOLCHAIN_SHA256: 62d66e0ad7bd7f2a183d236ee301a5c73c737c886c7944aa4f39415aab528daf
-  MODULE_DIR: modules/diagnostic-hello
-  ARTIFACT_NAME: patchnest-diagnostic-hello.kpm
-
 jobs:
   build:
     runs-on: ubuntu-24.04
+    env:
+      KP_REPOSITORY: KernelSU-Next/KPatch-Next
+      KP_COMMIT: 0fe6d142266b80e5aa445a7ea1534f88a8f33a35
+      ARM_TOOLCHAIN_URL: https://developer.arm.com/-/media/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+      ARM_TOOLCHAIN_SHA256: 62d66e6c97e37c0d7b42a90938e88d7a80016bda8681c53f3fb09876b7889a82
+      MODULE_DIR: modules/diagnostic-hello
     steps:
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Checkout tested revision
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Validate build-only metadata and source scope
+      - name: Record immutable source identity
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          node - <<'NODE'
-          const fs = require('node:fs');
-          const metadata = JSON.parse(fs.readFileSync('modules/diagnostic-hello/module.json', 'utf8'));
-          if (metadata.id !== 'patchnest-diagnostic-hello') throw new Error('unexpected module id');
-          if (metadata.installable !== false || metadata.channel !== 'build-only') {
-            throw new Error('diagnostic module must remain build-only and non-installable');
+          test -z "$(git status --porcelain --untracked-files=all)" || {
+            echo '::error::Source checkout is dirty before validation'
+            exit 1
           }
-          if (metadata.upstreamSdk.commit !== process.env.KP_COMMIT) {
-            throw new Error('metadata SDK commit does not match workflow pin');
-          }
-          const source = fs.readFileSync(metadata.source, 'utf8');
-          const prohibited = [
-            /hook_wrap/i,
-            /fp_hook/i,
-            /syscall_hook/i,
-            /kallsyms_lookup/i,
-            /selinux/i,
-            /mount/i,
-            /proc_maps/i,
-            /boot_state/i,
-            /module_hide/i,
-          ];
-          for (const pattern of prohibited) {
-            if (pattern.test(source)) throw new Error(`prohibited diagnostic capability: ${pattern}`);
-          }
-          for (const required of ['KPM_NAME(', 'KPM_VERSION(', 'KPM_INIT(', 'KPM_EXIT(']) {
-            if (!source.includes(required)) throw new Error(`missing ${required}`);
-          }
-          NODE
+          source_head=${PR_HEAD_SHA:-$GITHUB_SHA}
+          base_commit=${PR_BASE_SHA:-}
+          printf 'PATCHNEST_SOURCE_HEAD=%s\n' "$source_head" >> "$GITHUB_ENV"
+          printf 'PATCHNEST_BASE_COMMIT=%s\n' "$base_commit" >> "$GITHUB_ENV"
+          printf 'PATCHNEST_SOURCE_TREE_STATUS=clean\n' >> "$GITHUB_ENV"
+          printf 'tested checkout: %s\n' "$(git rev-parse HEAD)"
+          printf 'source head: %s\n' "$source_head"
+          printf 'base: %s\n' "${base_commit:-<none>}"
 
-      - name: Clone pinned KernelPatch SDK
+      - name: Validate declared source/build graph before network access
         run: |
           set -euo pipefail
-          git clone --filter=blob:none --no-checkout \
-            "https://github.com/${KP_REPOSITORY}.git" "$RUNNER_TEMP/kpatch-next"
+          python3 scripts/validate_diagnostic_build.py --mode source
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          data = json.loads(Path('modules/diagnostic-hello/module.json').read_text())
+          assert data['upstreamSdk']['repository'] == os.environ['KP_REPOSITORY']
+          assert data['upstreamSdk']['commit'] == os.environ['KP_COMMIT']
+          PY
+
+      - name: Checkout pinned KPatch SDK
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/${KP_REPOSITORY}.git "$RUNNER_TEMP/kpatch-next"
           git -C "$RUNNER_TEMP/kpatch-next" checkout --detach "$KP_COMMIT"
           test "$(git -C "$RUNNER_TEMP/kpatch-next" rev-parse HEAD)" = "$KP_COMMIT"
-          test -f "$RUNNER_TEMP/kpatch-next/kernel/include/kpmodule.h"
+          test -z "$(git -C "$RUNNER_TEMP/kpatch-next" status --porcelain --untracked-files=all)"
 
-      - name: Download and verify Arm toolchain
+      - name: Install pinned ARM GNU toolchain
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/arm-toolchain.tar.xz"
-          root="$RUNNER_TEMP/arm-toolchain"
-          curl -fL --retry 3 --retry-delay 2 "$ARM_TOOLCHAIN_URL" -o "$archive"
-          echo "$ARM_TOOLCHAIN_SHA256  $archive" | sha256sum -c -
-          mkdir -p "$root"
-          tar -xf "$archive" -C "$root"
-          prefix="$root/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin/aarch64-none-elf-"
-          test -x "${prefix}gcc"
-          echo "TARGET_COMPILE=$prefix" >> "$GITHUB_ENV"
+          curl --fail --location --retry 3 "$ARM_TOOLCHAIN_URL" --output "$archive"
+          printf '%s  %s\n' "$ARM_TOOLCHAIN_SHA256" "$archive" | sha256sum -c -
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          prefix=$(find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'arm-gnu-toolchain-*-x86_64-aarch64-none-elf' -print -quit)
+          test -n "$prefix"
+          printf 'TARGET_COMPILE=%s/bin/aarch64-none-elf-\n' "$prefix" >> "$GITHUB_ENV"
 
-      - name: Build diagnostic KPM
+      - name: Build declared diagnostic module
         run: |
           set -euo pipefail
           make -C "$MODULE_DIR" clean
           make -C "$MODULE_DIR" \
             TARGET_COMPILE="$TARGET_COMPILE" \
             KP_DIR="$RUNNER_TEMP/kpatch-next"
-          test -s "$MODULE_DIR/$ARTIFACT_NAME"
+          test -s "$MODULE_DIR/patchnest-diagnostic-hello.kpm"
+          test -s "$MODULE_DIR/diagnostic_hello.d"
+          test -s "$MODULE_DIR/diagnostic_hello.map"
 
-      - name: Inspect relocatable ARM64 artifact
+      - name: Inspect final ELF and actual build inputs
         run: |
           set -euo pipefail
-          artifact="$MODULE_DIR/$ARTIFACT_NAME"
-          description=$(file "$artifact")
-          echo "$description"
-          printf '%s' "$description" | grep -q 'ELF 64-bit'
+          artifact="$MODULE_DIR/patchnest-diagnostic-hello.kpm"
+          readelf="${TARGET_COMPILE}readelf"
+          "$readelf" -hW "$artifact" > "$MODULE_DIR/elf-header.txt"
+          "$readelf" -SW "$artifact" > "$MODULE_DIR/sections.txt"
+          "$readelf" -sW "$artifact" > "$MODULE_DIR/symbols.txt"
+          "$readelf" -rW "$artifact" > "$MODULE_DIR/relocations.txt"
 
-          readelf -h "$artifact" | tee "$MODULE_DIR/elf-header.txt"
-          readelf -SW "$artifact" | tee "$MODULE_DIR/sections.txt"
-          readelf -sW "$artifact" | tee "$MODULE_DIR/symbols.txt"
-          readelf -rW "$artifact" | tee "$MODULE_DIR/relocations.txt"
-
-          readelf -h "$artifact" | grep -Eq 'Type:[[:space:]]+REL'
-          readelf -h "$artifact" | grep -Eq 'Machine:[[:space:]]+AArch64'
-          strings "$artifact" | grep -Fx 'patchnest-diagnostic-hello'
-          strings "$artifact" | grep -Fx '0.1.0'
-          strings "$artifact" | grep -Fx 'patchnest-diagnostic-ok'
-
-          python3 - <<'PY'
-          import re
-          from pathlib import Path
-
-          lines = Path('modules/diagnostic-hello/sections.txt').read_text().splitlines()
-          pattern = re.compile(
-              r'^\s*\[\s*\d+\]\s+\S+\s+\S+\s+'
-              r'[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+'
-              r'\S+\s+(\S*)'
-          )
-          for line in lines:
-              match = pattern.match(line)
-              if not match:
-                  continue
-              flags = match.group(1)
-              if 'W' in flags and 'X' in flags:
-                  raise SystemExit(f'writable-executable KPM section: {line}')
-          PY
-
-          if grep -Eq 'R_AARCH64_(JUMP_SLOT|GLOB_DAT)' "$MODULE_DIR/relocations.txt"; then
-            echo '::error::Unexpected dynamic-linker relocation in KPM'
+          grep -Eq 'Type:[[:space:]]+REL' "$MODULE_DIR/elf-header.txt"
+          grep -Eq 'Machine:[[:space:]]+AArch64' "$MODULE_DIR/elf-header.txt"
+          if awk '$0 ~ / WAX | AXW | WA[X]/ { bad=1 } END { exit bad ? 0 : 1 }' "$MODULE_DIR/sections.txt"; then
+            echo '::error::Diagnostic KPM contains a writable+executable section'
+            exit 1
+          fi
+          if grep -Eq 'R_AARCH64_(JUMP_SLOT|GLOB_DAT|COPY)' "$MODULE_DIR/relocations.txt"; then
+            echo '::error::Diagnostic KPM contains dynamic-linker relocation types'
             exit 1
           fi
 
-      - name: Generate provenance manifest
+          python3 scripts/validate_diagnostic_build.py \
+            --mode artifact \
+            --readelf "$readelf" \
+            --output "$MODULE_DIR/build-inputs.json"
+
+      - name: Write unambiguous build provenance
         run: |
           set -euo pipefail
-          artifact="$MODULE_DIR/$ARTIFACT_NAME"
-          sha=$(sha256sum "$artifact" | awk '{print $1}')
-          size=$(stat -c '%s' "$artifact")
-          cat > "$MODULE_DIR/build-provenance.json" <<EOF
-          {
-            "artifact": "$ARTIFACT_NAME",
-            "sha256": "$sha",
-            "size": $size,
-            "sourceCommit": "$GITHUB_SHA",
-            "sdkRepository": "$KP_REPOSITORY",
-            "sdkCommit": "$KP_COMMIT",
-            "toolchain": "arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf",
-            "toolchainSha256": "$ARM_TOOLCHAIN_SHA256",
-            "installable": false,
-            "deviceValidated": false
-          }
-          EOF
-          cat "$MODULE_DIR/build-provenance.json"
+          python3 scripts/write_build_provenance.py \
+            --artifact "$MODULE_DIR/patchnest-diagnostic-hello.kpm" \
+            --inputs "$MODULE_DIR/build-inputs.json" \
+            --output "$MODULE_DIR/build-provenance.json"
 
-      - name: Upload build-only diagnostic artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+      - name: Verify provenance semantics
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = json.loads(Path('modules/diagnostic-hello/build-provenance.json').read_text())
+          assert p['schemaVersion'] == 2
+          assert p['sourceHeadCommit'] == os.environ['PATCHNEST_SOURCE_HEAD']
+          assert p['testedCommit'] == os.environ['GITHUB_SHA']
+          if os.environ['GITHUB_EVENT_NAME'] == 'pull_request':
+              assert p['baseCommit'] == os.environ['PATCHNEST_BASE_COMMIT']
+              assert p['testedMergeCommit'] == os.environ['GITHUB_SHA']
+          else:
+              assert p['baseCommit'] is None
+              assert p['testedMergeCommit'] is None
+          PY
+
+      - name: Upload build-only diagnostic evidence
+        uses: actions/upload-artifact@v6
         with:
-          name: diagnostic-kpm-${{ github.sha }}
+          name: patchnest-diagnostic-${{ github.sha }}
           path: |
             modules/diagnostic-hello/patchnest-diagnostic-hello.kpm
+            modules/diagnostic-hello/diagnostic_hello.d
+            modules/diagnostic-hello/diagnostic_hello.map
+            modules/diagnostic-hello/build-inputs.json
             modules/diagnostic-hello/build-provenance.json
             modules/diagnostic-hello/elf-header.txt
             modules/diagnostic-hello/sections.txt
