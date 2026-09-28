@@ -1,5 +1,8 @@
 # PatchNest KPM Repository
 
+> **Canonical repository:** active KPM catalog/source development has moved to [`Zhanfg/PatchNest`](https://github.com/Zhanfg/PatchNest), under `kpms/`. This repository remains intact for provenance, legacy raw-catalog compatibility, and the outstanding physical-validation draft.
+
+
 Official KPM catalog and source workspace for [`PatchNest-Module`](https://github.com/Zhanfg/PatchNest-Module).
 
 KernelPatch SDK canonical source: [`Zhanfg/KernelPatch-Public`](https://github.com/Zhanfg/KernelPatch-Public). The legacy `ZhanfgBuild/KernelPatch` predecessor is retained only for provenance and must not be used for new PatchNest builds.
