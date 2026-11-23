@@ -1,5 +1,7 @@
 # PatchNest KPM Repository
 
+> **Archived on 2026-11-23 — this repository is read-only.**
+>
 > **Canonical repository:** active KPM catalog/source development has moved to [`Zhanfg/PatchNest`](https://github.com/Zhanfg/PatchNest), under `kpms/`. This repository remains intact for provenance, legacy raw-catalog compatibility, and the outstanding physical-validation draft.
 
 
